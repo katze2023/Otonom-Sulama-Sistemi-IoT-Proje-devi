@@ -1,0 +1,824 @@
+/**
+ * ============================================================
+ *  IoT TABANLI OTOMATİK BAHÇE SULAMA VE VERİ TAKİP SİSTEMİ
+ *  Arduino Uno R3 - Edge Computing Node
+ * ============================================================
+ *
+ *  Mimari   : Master-Slave Hibrit IoT Mimarisi
+ *  Görev    : Sensör Veri Toplama | Edge Processing | Karar Motoru | UART Gateway
+ *  Platform : Arduino Uno R3 (ATmega328P)
+ *  IDE      : Arduino IDE 2.x
+ *
+ *  Yazar    : Fatih Kaya - G231210072
+ *  Ders     : Nesnelerin İnterneti ve Uygulamaları
+ *  Tarih    : 2025
+ *
+ * ============================================================
+ *  KATMANLI MİMARİ (Layered Architecture):
+ *
+ *  [1] HAL  - Hardware Abstraction Layer  (Donanım soyutlama)
+ *  [2] SPL  - Sensor Processing Layer    (Sensör işleme & filtreleme)
+ *  [3] DEL  - Decision Engine Layer      (Karar motoru)
+ *  [4] CML  - Communication Layer        (UART paketleme & iletim)
+ *  [5] SHL  - System Health Layer        (Sistem sağlık izleme)
+ *
+ * ============================================================
+ *  KULLANILAN KÜTÜPHANELER:
+ *  - DHT.h            : DHT11 sıcaklık/nem sensörü (Adafruit DHT Sensor Library)
+ *  - SoftwareSerial.h : NodeMCU UART haberleşmesi (Arduino Built-in)
+ *
+ * ============================================================
+ *  PIN YAPISI:
+ *  A1 → Yağmur Sensörü (HW-028)
+ *  A2 → MQ-2 Gaz Sensörü
+ *  A3 → Toprak Nem Sensörü (YL-69)
+ *  A4 → Su Seviye Sensörü (HW-038)
+ *  A5 → LDR (Işık Sensörü)
+ *  D8 → DHT11 (Sıcaklık & Nem)
+ *  D9 → Röle Modülü (Pompa Kontrolü)
+ *  D10 → SoftwareSerial RX (NodeMCU D6 TX'ten gelir, direkt bağlantı)
+ *  D11 → SoftwareSerial TX (NodeMCU D5 RX'e gider, 10kΩ+20kΩ voltaj bölücü ile)
+ * ============================================================
+ */
+
+#include <DHT.h>
+#include <SoftwareSerial.h>
+
+// ============================================================
+//  BÖLÜM 1: SABİTLER VE KONFİGÜRASYON
+// ============================================================
+
+// --- Versiyon ---
+#define FIRMWARE_VERSION        "1.0.0"
+#define DEVICE_ID               "ARD-GW-01"
+
+// --- Pin Tanımları ---
+#define PIN_RAIN_SENSOR         A1
+#define PIN_MQ2_SENSOR          A2
+#define PIN_SOIL_SENSOR         A3
+#define PIN_WATER_LEVEL_SENSOR  A4
+#define PIN_LDR_SENSOR          A5
+#define PIN_DHT11               8
+#define PIN_RELAY               9
+#define PIN_SOFT_RX             10   // Arduino D10 ← NodeMCU D6 (GPIO12) TX
+#define PIN_SOFT_TX             11   // Arduino D11 → NodeMCU D5 (GPIO14) RX [voltaj bölücü!]
+
+// --- DHT Tipi ---
+#define DHT_TYPE                DHT11
+
+// --- Zamanlama Sabitleri (ms) ---
+#define INTERVAL_SENSOR_READ    2000UL    // Sensör okuma periyodu
+#define INTERVAL_UART_SEND      5000UL    // UART gönderim periyodu
+#define INTERVAL_HEALTH_CHECK   10000UL   // Sağlık kontrolü periyodu
+#define INTERVAL_DEBUG_PRINT    3000UL    // Debug çıktı periyodu
+#define PUMP_MAX_ON_TIME        30000UL   // Pompa maks. çalışma süresi (30 sn)
+#define PUMP_COOLDOWN_TIME      60000UL   // Pompa bekleme süresi (60 sn)
+#define SENSOR_FREEZE_TIMEOUT   30000UL   // Sensör donma eşiği
+
+// --- Sensör Eşik Değerleri (Sulama Algoritması) ---
+#define THRESHOLD_SOIL_DRY      700       // Toprak kuru eşiği (üzeri = kuru)
+#define THRESHOLD_RAIN_ABSENT   500       // Yağmur yok eşiği (üzeri = yağmur yok)
+#define THRESHOLD_WATER_OK      200       // Su seviyesi yeterli eşiği
+#define THRESHOLD_LDR_NIGHT     700       // Gece/Akşam eşiği (üzeri = karanlık)
+#define THRESHOLD_MQ2_DANGER    600       // Gaz tehlike eşiği
+#define THRESHOLD_TEMP_MIN      10.0      // Sulama için min uygun sıcaklık (°C)
+#define THRESHOLD_TEMP_MAX      40.0      // Sulama için max uygun sıcaklık (°C)
+
+// --- Sensör Geçerlilik Sınırları ---
+#define ANALOG_MIN              10        // Analog min geçerli değer (0 = bağlı değil)
+#define ANALOG_MAX              1010      // Analog max geçerli değer (1023 = kısa devre)
+#define MOVING_AVG_SAMPLES      8         // Hareketli ortalama örnek sayısı
+#define FREEZE_TOLERANCE        5         // Donma tespiti için değişim toleransı
+
+// --- Hata Kodları ---
+#define ERR_NONE                0x00
+#define ERR_SOIL_FAULT          0x01
+#define ERR_RAIN_FAULT          0x02
+#define ERR_WATER_FAULT         0x04
+#define ERR_LDR_FAULT           0x08
+#define ERR_MQ2_FAULT           0x10
+#define ERR_DHT_FAULT           0x20
+#define ERR_PUMP_OVERTIME       0x40
+#define ERR_CRITICAL_GAS        0x80
+
+// ============================================================
+//  BÖLÜM 2: VERİ TİPLERİ (Enums & Structs)
+// ============================================================
+
+enum SensorStatus {
+  SENSOR_OK = 0,        // Sensör sağlıklı çalışıyor
+  SENSOR_FAULT,         // Sensör arızalı (aralık dışı)
+  SENSOR_FROZEN,        // Sensör donmuş (değer değişmiyor)
+  SENSOR_DISCONNECTED,  // Sensör bağlı değil (sürekli 0 veya 1023)
+  SENSOR_UNSTABLE       // Sensör kararsız (anormal sıçramalar)
+};
+
+enum SystemState {
+  STATE_INIT = 0,       // Başlatma aşaması
+  STATE_MONITORING,     // Normal izleme modu
+  STATE_IRRIGATING,     // Sulama aktif
+  STATE_COOLDOWN,       // Pompa bekleme süresi
+  STATE_FAULT,          // Kritik hata durumu
+  STATE_EMERGENCY       // Acil durum (gaz algılandı)
+};
+
+enum PumpState {
+  PUMP_OFF = 0,
+  PUMP_ON,
+  PUMP_COOLDOWN,
+  PUMP_FAULT
+};
+
+struct SensorData {
+  // Ham değerler
+  int rawSoilMoisture;
+  int rawRainSensor;
+  int rawWaterLevel;
+  int rawLDR;
+  int rawMQ2;
+  float rawTemperature;
+  float rawHumidity;
+
+  // Filtreli (Moving Average) değerler
+  float filtSoilMoisture;
+  float filtRainSensor;
+  float filtWaterLevel;
+  float filtLDR;
+  float filtMQ2;
+
+  // DHT11 geçerlilik
+  bool dhtValid;
+};
+
+struct SensorHealth {
+  SensorStatus  status;          // Operasyonel durum
+  int           lastValidValue;  // Son geçerli değer
+  unsigned long lastUpdateTime;  // Son başarılı okuma zamanı
+  unsigned long lastChangeTime;  // Son değer değişim zamanı
+  bool          hasFault;        // Arıza bayrağı
+  uint8_t       faultCode;       // Hata kodu biti
+  int           prevValue;       // Önceki değer (donma tespiti için)
+};
+
+struct SystemHealth {
+  SensorHealth soil;
+  SensorHealth rain;
+  SensorHealth water;
+  SensorHealth ldr;
+  SensorHealth mq2;
+  SensorHealth dht;
+  uint8_t      globalFaultMask;  // Tüm hata bitlerinin OR'u
+  bool         criticalFault;    // Kritik hata var mı?
+};
+
+struct IrrigationDecision {
+  bool  shouldIrrigate;     // Sulama yapılsın mı?
+  bool  soilCondition;      // Toprak nem koşulu sağlandı mı?
+  bool  rainCondition;      // Yağmur koşulu sağlandı mı?
+  bool  waterCondition;     // Su seviye koşulu sağlandı mı?
+  bool  lightCondition;     // Işık koşulu sağlandı mı?
+  bool  tempCondition;      // Sıcaklık koşulu sağlandı mı? (10°C < T < 40°C)
+  bool  sensorHealthy;      // Sensörler sağlıklı mı?
+  bool  gasCondition;       // Gaz tehlikesi yok mu?
+  bool  pumpSafe;           // Pompa güvenli çalışabilir mi?
+  char  reason[64];         // İnsan okunabilir karar gerekçesi
+};
+
+struct PumpControl {
+  PumpState     state;
+  bool          active;
+  unsigned long onStartTime;
+  unsigned long offStartTime;
+  unsigned long totalOnTime;
+  bool          overTimeProtection;
+  bool          dryRunProtection;
+};
+
+// ============================================================
+//  BÖLÜM 3: MOVING AVERAGE FİLTRE YAPISI
+// ============================================================
+
+struct MovingAvgFilter {
+  int     buffer[MOVING_AVG_SAMPLES];
+  uint8_t index;
+  bool    filled;
+  long    sum;
+};
+
+// ============================================================
+//  BÖLÜM 4: GLOBAL NESNELER VE DEĞİŞKENLER
+// ============================================================
+
+// --- Donanım Nesneleri ---
+DHT dht(PIN_DHT11, DHT_TYPE);
+SoftwareSerial nodeSerial(PIN_SOFT_RX, PIN_SOFT_TX);
+
+// --- Global Veri Yapıları ---
+SensorData         sensorData;
+SystemHealth       systemHealth;
+IrrigationDecision decision;
+PumpControl        pumpCtrl;
+
+// --- Moving Average Filtreleri ---
+MovingAvgFilter filterSoil;
+MovingAvgFilter filterRain;
+MovingAvgFilter filterWater;
+MovingAvgFilter filterLDR;
+MovingAvgFilter filterMQ2;
+
+// --- Sistem Durumu ---
+SystemState currentState = STATE_INIT;
+
+// --- Zamanlama değişkenleri (millis tabanlı) ---
+unsigned long lastSensorReadTime  = 0;
+unsigned long lastUartSendTime    = 0;
+unsigned long lastHealthCheckTime = 0;
+unsigned long lastDebugPrintTime  = 0;
+
+// --- Paket Sayacı ---
+uint32_t packetCounter = 0;
+
+// ============================================================
+//  BÖLÜM 5: FONKSİYON PROTOTİPLERİ
+// ============================================================
+
+// [HAL] Hardware Abstraction Layer
+void     hal_initPins();
+int      hal_readAnalog(uint8_t pin);
+bool     hal_setRelay(bool state);
+
+// [SPL] Sensor Processing Layer
+void     spl_readAllSensors();
+int      spl_applyMovingAvg(MovingAvgFilter& f, int newVal);
+bool     spl_isAnalogValid(int val);
+void     spl_readDHT();
+
+// [SHL] System Health Layer
+void     shl_checkAllSensors();
+void     shl_checkAnalogSensor(SensorHealth& h, int rawVal, uint8_t faultBit);
+void     shl_checkDHTSensor();
+void     shl_updateGlobalFaultMask();
+
+// [DEL] Decision Engine Layer
+void     del_evaluate();
+void     del_runPumpControl();
+bool     del_isPumpSafe();
+
+// [CML] Communication Layer
+void     cml_sendUARTPacket();
+void     cml_buildPacket(char* buf, size_t bufSize);
+
+// [SYS] System Layer
+void        sys_printDebug();
+void        sys_printBanner();
+void        sys_handleState();
+const char* sys_stateToStr(SystemState s);
+const char* sys_sensorStatusToStr(SensorStatus s);
+
+// ============================================================
+//  BÖLÜM 6: SETUP
+// ============================================================
+
+void setup() {
+  // Donanım başlatma
+  hal_initPins();
+
+  // Seri portlar
+  Serial.begin(9600);
+  nodeSerial.begin(9600);
+
+  // DHT başlatma
+  dht.begin();
+
+  // Yapıları sıfırla
+  memset(&sensorData,   0, sizeof(sensorData));
+  memset(&systemHealth, 0, sizeof(systemHealth));
+  memset(&decision,     0, sizeof(decision));
+  memset(&pumpCtrl,     0, sizeof(pumpCtrl));
+  memset(&filterSoil,   0, sizeof(filterSoil));
+  memset(&filterRain,   0, sizeof(filterRain));
+  memset(&filterWater,  0, sizeof(filterWater));
+  memset(&filterLDR,    0, sizeof(filterLDR));
+  memset(&filterMQ2,    0, sizeof(filterMQ2));
+
+  // Pompa güvenli kapalı konumda başlat
+  hal_setRelay(false);
+  pumpCtrl.state  = PUMP_OFF;
+  pumpCtrl.active = false;
+
+  // Sensör hata kodlarını ata
+  systemHealth.soil.faultCode  = ERR_SOIL_FAULT;
+  systemHealth.rain.faultCode  = ERR_RAIN_FAULT;
+  systemHealth.water.faultCode = ERR_WATER_FAULT;
+  systemHealth.ldr.faultCode   = ERR_LDR_FAULT;
+  systemHealth.mq2.faultCode   = ERR_MQ2_FAULT;
+  systemHealth.dht.faultCode   = ERR_DHT_FAULT;
+
+  currentState = STATE_MONITORING;
+
+  sys_printBanner();
+  Serial.println(F("[SYS] Sistem başlatıldı. İzleme moduna geçildi."));
+}
+
+// ============================================================
+//  BÖLÜM 7: MAIN LOOP (Non-Blocking)
+// ============================================================
+
+void loop() {
+  unsigned long now = millis();
+
+  // [TASK-1] Sensör okuma görevi
+  if (now - lastSensorReadTime >= INTERVAL_SENSOR_READ) {
+    lastSensorReadTime = now;
+    spl_readAllSensors();
+    shl_checkAllSensors();
+    del_evaluate();
+    del_runPumpControl();
+  }
+
+  // [TASK-2] UART gönderim görevi
+  if (now - lastUartSendTime >= INTERVAL_UART_SEND) {
+    lastUartSendTime = now;
+    cml_sendUARTPacket();
+  }
+
+  // [TASK-3] Sağlık kontrolü görevi
+  if (now - lastHealthCheckTime >= INTERVAL_HEALTH_CHECK) {
+    lastHealthCheckTime = now;
+    shl_updateGlobalFaultMask();
+    sys_handleState();
+  }
+
+  // [TASK-4] Debug çıktı görevi
+  if (now - lastDebugPrintTime >= INTERVAL_DEBUG_PRINT) {
+    lastDebugPrintTime = now;
+    sys_printDebug();
+  }
+}
+
+// ============================================================
+//  BÖLÜM 8: HAL - DONANIM SOYUTLAMA KATMANI
+// ============================================================
+
+void hal_initPins() {
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, LOW); // Fail-safe: röle kapalı başlat
+
+  pinMode(PIN_RAIN_SENSOR,        INPUT);
+  pinMode(PIN_MQ2_SENSOR,         INPUT);
+  pinMode(PIN_SOIL_SENSOR,        INPUT);
+  pinMode(PIN_WATER_LEVEL_SENSOR, INPUT);
+  pinMode(PIN_LDR_SENSOR,         INPUT);
+}
+
+int hal_readAnalog(uint8_t pin) {
+  long sum = 0;
+  for (uint8_t i = 0; i < 3; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  return (int)(sum / 3);
+}
+
+bool hal_setRelay(bool state) {
+  digitalWrite(PIN_RELAY, state ? HIGH : LOW);
+  return state;
+}
+
+// ============================================================
+//  BÖLÜM 9: SPL - SENSÖR İŞLEME KATMANI
+// ============================================================
+
+void spl_readAllSensors() {
+  // Analog sensör okumaları
+  sensorData.rawSoilMoisture = hal_readAnalog(PIN_SOIL_SENSOR);
+  sensorData.rawRainSensor   = hal_readAnalog(PIN_RAIN_SENSOR);
+  sensorData.rawWaterLevel   = hal_readAnalog(PIN_WATER_LEVEL_SENSOR);
+  sensorData.rawLDR          = hal_readAnalog(PIN_LDR_SENSOR);
+  sensorData.rawMQ2          = hal_readAnalog(PIN_MQ2_SENSOR);
+
+  // Moving Average filtresi uygula
+  sensorData.filtSoilMoisture = spl_applyMovingAvg(filterSoil,  sensorData.rawSoilMoisture);
+  sensorData.filtRainSensor   = spl_applyMovingAvg(filterRain,  sensorData.rawRainSensor);
+  sensorData.filtWaterLevel   = spl_applyMovingAvg(filterWater, sensorData.rawWaterLevel);
+  sensorData.filtLDR          = spl_applyMovingAvg(filterLDR,   sensorData.rawLDR);
+  sensorData.filtMQ2          = spl_applyMovingAvg(filterMQ2,   sensorData.rawMQ2);
+
+  // DHT11 oku
+  spl_readDHT();
+}
+
+int spl_applyMovingAvg(MovingAvgFilter& f, int newVal) {
+  f.sum -= f.buffer[f.index];
+  f.buffer[f.index] = newVal;
+  f.sum += newVal;
+  f.index = (f.index + 1) % MOVING_AVG_SAMPLES;
+  if (f.index == 0) f.filled = true;
+
+  uint8_t count = f.filled ? MOVING_AVG_SAMPLES : f.index;
+  if (count == 0) return newVal;
+  return (int)(f.sum / count);
+}
+
+void spl_readDHT() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  if (isnan(t) || isnan(h)) {
+    sensorData.dhtValid = false;
+  } else {
+    sensorData.rawTemperature = t;
+    sensorData.rawHumidity    = h;
+    sensorData.dhtValid       = true;
+  }
+}
+
+bool spl_isAnalogValid(int val) {
+  return (val > ANALOG_MIN && val < ANALOG_MAX);
+}
+
+// ============================================================
+//  BÖLÜM 10: SHL - SİSTEM SAĞLIK KATMANI
+// ============================================================
+
+void shl_checkAllSensors() {
+  shl_checkAnalogSensor(systemHealth.soil,  (int)sensorData.filtSoilMoisture, ERR_SOIL_FAULT);
+  shl_checkAnalogSensor(systemHealth.rain,  (int)sensorData.filtRainSensor,   ERR_RAIN_FAULT);
+  shl_checkAnalogSensor(systemHealth.water, (int)sensorData.filtWaterLevel,   ERR_WATER_FAULT);
+  shl_checkAnalogSensor(systemHealth.ldr,   (int)sensorData.filtLDR,          ERR_LDR_FAULT);
+  shl_checkAnalogSensor(systemHealth.mq2,   (int)sensorData.filtMQ2,          ERR_MQ2_FAULT);
+  shl_checkDHTSensor();
+  shl_updateGlobalFaultMask();
+}
+
+void shl_checkAnalogSensor(SensorHealth& h, int rawVal, uint8_t faultBit) {
+  unsigned long now = millis();
+
+  if (rawVal <= ANALOG_MIN) {
+    h.status   = SENSOR_DISCONNECTED;
+    h.hasFault = true;
+    Serial.print(F("[SHL] HATA: Sensör bağlı değil / 0V! Bit: 0x"));
+    Serial.println(faultBit, HEX);
+    return;
+  }
+  if (rawVal >= ANALOG_MAX) {
+    h.status   = SENSOR_DISCONNECTED;
+    h.hasFault = true;
+    Serial.print(F("[SHL] HATA: Sensör kısa devre / 5V sabit! Bit: 0x"));
+    Serial.println(faultBit, HEX);
+    return;
+  }
+
+  if (abs(rawVal - h.prevValue) > FREEZE_TOLERANCE) {
+    h.lastChangeTime = now;
+    h.prevValue      = rawVal;
+  }
+  if ((now - h.lastChangeTime) > SENSOR_FREEZE_TIMEOUT) {
+    h.status   = SENSOR_FROZEN;
+    h.hasFault = true;
+    Serial.print(F("[SHL] UYARI: Sensör donmuş görünüyor! Bit: 0x"));
+    Serial.println(faultBit, HEX);
+    return;
+  }
+
+  if (h.lastValidValue != 0) {
+    int delta = abs(rawVal - h.lastValidValue);
+    if (delta > 300) {
+      h.status = SENSOR_UNSTABLE;
+      Serial.print(F("[SHL] UYARI: Anormal sıçrama tespit edildi! Delta: "));
+      Serial.println(delta);
+    }
+  }
+
+  h.status         = SENSOR_OK;
+  h.hasFault       = false;
+  h.lastValidValue = rawVal;
+  h.lastUpdateTime = now;
+}
+
+void shl_checkDHTSensor() {
+  unsigned long now = millis();
+  if (!sensorData.dhtValid) {
+    systemHealth.dht.status   = SENSOR_FAULT;
+    systemHealth.dht.hasFault = true;
+    Serial.println(F("[SHL] HATA: DHT11 geçersiz veri döndürüyor (NaN)!"));
+  } else {
+    if (sensorData.rawTemperature < -10.0 || sensorData.rawTemperature > 80.0) {
+      systemHealth.dht.status   = SENSOR_FAULT;
+      systemHealth.dht.hasFault = true;
+    } else {
+      systemHealth.dht.status         = SENSOR_OK;
+      systemHealth.dht.hasFault       = false;
+      systemHealth.dht.lastUpdateTime = now;
+    }
+  }
+}
+
+void shl_updateGlobalFaultMask() {
+  uint8_t mask = ERR_NONE;
+  if (systemHealth.soil.hasFault)  mask |= ERR_SOIL_FAULT;
+  if (systemHealth.rain.hasFault)  mask |= ERR_RAIN_FAULT;
+  if (systemHealth.water.hasFault) mask |= ERR_WATER_FAULT;
+  if (systemHealth.ldr.hasFault)   mask |= ERR_LDR_FAULT;
+  if (systemHealth.mq2.hasFault)   mask |= ERR_MQ2_FAULT;
+  if (systemHealth.dht.hasFault)   mask |= ERR_DHT_FAULT;
+  if (pumpCtrl.overTimeProtection) mask |= ERR_PUMP_OVERTIME;
+  if (sensorData.filtMQ2 > THRESHOLD_MQ2_DANGER) mask |= ERR_CRITICAL_GAS;
+
+  systemHealth.globalFaultMask = mask;
+
+  systemHealth.criticalFault = (
+    systemHealth.soil.hasFault  ||
+    systemHealth.water.hasFault ||
+    systemHealth.dht.hasFault
+  );
+}
+
+// ============================================================
+//  BÖLÜM 11: DEL - KARAR MOTORU KATMANI
+// ============================================================
+
+void del_evaluate() {
+  // Koşulları filtreli değerler üzerinden değerlendir
+  decision.soilCondition  = (sensorData.filtSoilMoisture > THRESHOLD_SOIL_DRY);
+  decision.rainCondition  = (sensorData.filtRainSensor   > THRESHOLD_RAIN_ABSENT);
+  decision.waterCondition = (sensorData.filtWaterLevel   > THRESHOLD_WATER_OK);
+  decision.lightCondition = (sensorData.filtLDR          > THRESHOLD_LDR_NIGHT);
+  decision.tempCondition  = (sensorData.rawTemperature   > THRESHOLD_TEMP_MIN &&
+                             sensorData.rawTemperature   < THRESHOLD_TEMP_MAX);
+  decision.sensorHealthy  = !systemHealth.criticalFault;
+  decision.gasCondition   = (sensorData.filtMQ2          < THRESHOLD_MQ2_DANGER);
+  decision.pumpSafe       = del_isPumpSafe();
+
+  // Nihai karar: Tüm koşullar sağlanmalı
+  decision.shouldIrrigate = (
+    decision.soilCondition  &&
+    decision.rainCondition  &&
+    decision.waterCondition &&
+    decision.lightCondition &&
+    decision.tempCondition  &&
+    decision.sensorHealthy  &&
+    decision.gasCondition   &&
+    decision.pumpSafe
+  );
+
+  // Acil durum: Gaz algılandı
+  if (!decision.gasCondition) {
+    currentState = STATE_EMERGENCY;
+    hal_setRelay(false);
+    strcpy(decision.reason, "ACIL: Gaz tehlikesi! Pompa kapatildi.");
+    return;
+  }
+
+  // Karar gerekçesini yaz
+  if (!decision.soilCondition)       strcpy(decision.reason, "Toprak yeterince nemli.");
+  else if (!decision.lightCondition) strcpy(decision.reason, "Gunduz: Buharlasma riski, ertelendi.");
+  else if (!decision.rainCondition)  strcpy(decision.reason, "Yagmur algilandi.");
+  else if (!decision.waterCondition) strcpy(decision.reason, "Su deposu yetersiz.");
+  else if (!decision.tempCondition)  strcpy(decision.reason, "Sicaklik uygun aralikta degil (10-40C).");
+  else if (!decision.sensorHealthy)  strcpy(decision.reason, "Kritik sensor arizasi.");
+  else if (!decision.pumpSafe)       strcpy(decision.reason, "Pompa guvenlik korumasi aktif.");
+  else if (decision.shouldIrrigate)  strcpy(decision.reason, "Tum kosullar saglandi. Sulama aktif.");
+  else                               strcpy(decision.reason, "Bekleme.");
+}
+
+bool del_isPumpSafe() {
+  if (pumpCtrl.state == PUMP_COOLDOWN) {
+    if ((millis() - pumpCtrl.offStartTime) < PUMP_COOLDOWN_TIME) {
+      return false;
+    } else {
+      pumpCtrl.state              = PUMP_OFF;
+      pumpCtrl.overTimeProtection = false;
+    }
+  }
+  if (pumpCtrl.overTimeProtection) return false;
+  return true;
+}
+
+void del_runPumpControl() {
+  unsigned long now = millis();
+
+  if (decision.shouldIrrigate && currentState != STATE_EMERGENCY) {
+    if (!pumpCtrl.active) {
+      pumpCtrl.active      = true;
+      pumpCtrl.onStartTime = now;
+      pumpCtrl.state       = PUMP_ON;
+      hal_setRelay(true);
+      currentState = STATE_IRRIGATING;
+      Serial.println(F("[DEL] Pompa ACILDI. Sulama basladi."));
+    }
+
+    if ((now - pumpCtrl.onStartTime) >= PUMP_MAX_ON_TIME) {
+      pumpCtrl.active             = false;
+      pumpCtrl.overTimeProtection = true;
+      pumpCtrl.offStartTime       = now;
+      pumpCtrl.state              = PUMP_COOLDOWN;
+      hal_setRelay(false);
+      currentState = STATE_COOLDOWN;
+      Serial.println(F("[DEL] UYARI: Pompa maks. sure korumasi! Soguma basladi."));
+    }
+  } else {
+    if (pumpCtrl.active) {
+      pumpCtrl.active       = false;
+      pumpCtrl.offStartTime = now;
+      pumpCtrl.totalOnTime += (now - pumpCtrl.onStartTime);
+      if (pumpCtrl.state != PUMP_COOLDOWN) {
+        pumpCtrl.state = PUMP_OFF;
+      }
+      hal_setRelay(false);
+      if (currentState == STATE_IRRIGATING) {
+        currentState = STATE_MONITORING;
+      }
+      Serial.print(F("[DEL] Pompa KAPATILDI. Neden: "));
+      Serial.println(decision.reason);
+    }
+  }
+}
+
+// ============================================================
+//  BÖLÜM 12: CML - İLETİŞİM KATMANI
+// ============================================================
+
+void cml_sendUARTPacket() {
+  char packet[200];
+  cml_buildPacket(packet, sizeof(packet));
+  nodeSerial.println(packet);
+  Serial.print(F("[CML] UART Gonderildi -> "));
+  Serial.println(packet);
+  packetCounter++;
+}
+
+void cml_buildPacket(char* buf, size_t bufSize) {
+  int tempInt = (int)sensorData.rawTemperature;
+  int tempDec = (int)((sensorData.rawTemperature - tempInt) * 10);
+  int humInt  = (int)sensorData.rawHumidity;
+  int humDec  = (int)((sensorData.rawHumidity  - humInt)  * 10);
+
+  snprintf(buf, bufSize,
+    "<ID:%s,PKT:%05lu,"
+    "T:%d.%d,H:%d.%d,"
+    "SOIL:%d,RAIN:%d,WATER:%d,LDR:%d,MQ2:%d,"
+    "PUMP:%d,FAULT:0x%02X,STATE:%s>",
+    DEVICE_ID,
+    packetCounter,
+    tempInt, abs(tempDec),
+    humInt,  abs(humDec),
+    (int)sensorData.filtSoilMoisture,
+    (int)sensorData.filtRainSensor,
+    (int)sensorData.filtWaterLevel,
+    (int)sensorData.filtLDR,
+    (int)sensorData.filtMQ2,
+    pumpCtrl.active ? 1 : 0,
+    systemHealth.globalFaultMask,
+    sys_stateToStr(currentState)
+  );
+}
+
+// ============================================================
+//  BÖLÜM 13: SYS - SİSTEM KATMANI & DEBUG
+// ============================================================
+
+void sys_handleState() {
+  if (systemHealth.globalFaultMask & ERR_CRITICAL_GAS) {
+    currentState = STATE_EMERGENCY;
+  } else if (systemHealth.criticalFault && !pumpCtrl.active) {
+    currentState = STATE_FAULT;
+  } else if (pumpCtrl.state == PUMP_COOLDOWN) {
+    currentState = STATE_COOLDOWN;
+  } else if (pumpCtrl.active) {
+    currentState = STATE_IRRIGATING;
+  } else if (currentState != STATE_EMERGENCY) {
+    currentState = STATE_MONITORING;
+  }
+}
+
+void sys_printDebug() {
+  Serial.println(F("\n=========================================="));
+  Serial.println(F("   IoT BAHCE SULAMA - SISTEM MONITORU    "));
+  Serial.println(F("=========================================="));
+
+  Serial.print(F("  DURUM  : "));
+  Serial.print(sys_stateToStr(currentState));
+  Serial.print(F("   PKT#: "));
+  Serial.println(packetCounter);
+  Serial.println(F("------------------------------------------"));
+
+  Serial.println(F("  SENSOR           DEGER    DURUM        "));
+  Serial.println(F("------------------------------------------"));
+
+  Serial.print(F("  Sicaklik      :  "));
+  Serial.print(sensorData.rawTemperature, 1);
+  Serial.print(F(" C    "));
+  if (!decision.tempCondition)               Serial.println(F("[!! UYGUN DEGIL]"));
+  else                                       Serial.println(F("[OK]"));
+
+  Serial.print(F("  Nem           :  "));
+  Serial.print(sensorData.rawHumidity, 1);
+  Serial.print(F(" %    "));
+  if (!sensorData.dhtValid)                  Serial.println(F("[!! HATA]"));
+  else                                       Serial.println(F("[OK]"));
+
+  Serial.print(F("  Toprak Nem    :  "));
+  Serial.print((int)sensorData.filtSoilMoisture);
+  Serial.print(F("       "));
+  if (systemHealth.soil.hasFault)            Serial.println(F("[!! ARIZALI]"));
+  else if (decision.soilCondition)           Serial.println(F("[KURU  -> SULA]"));
+  else                                       Serial.println(F("[NEMLI -> OK]"));
+
+  Serial.print(F("  Yagmur        :  "));
+  Serial.print((int)sensorData.filtRainSensor);
+  Serial.print(F("       "));
+  if (systemHealth.rain.hasFault)            Serial.println(F("[!! ARIZALI]"));
+  else if (decision.rainCondition)           Serial.println(F("[YAGMUR YOK]"));
+  else                                       Serial.println(F("[YAGMUR VAR!]"));
+
+  Serial.print(F("  Su Seviyesi   :  "));
+  Serial.print((int)sensorData.filtWaterLevel);
+  Serial.print(F("       "));
+  if (systemHealth.water.hasFault)           Serial.println(F("[!! ARIZALI]"));
+  else if (decision.waterCondition)          Serial.println(F("[YETERLI]"));
+  else                                       Serial.println(F("[!! DUSUK]"));
+
+  Serial.print(F("  Isik (LDR)    :  "));
+  Serial.print((int)sensorData.filtLDR);
+  Serial.print(F("       "));
+  if (systemHealth.ldr.hasFault)             Serial.println(F("[!! ARIZALI]"));
+  else if (decision.lightCondition)          Serial.println(F("[GECE]"));
+  else                                       Serial.println(F("[GUNDUZ]"));
+
+  Serial.print(F("  Gaz (MQ-2)    :  "));
+  Serial.print((int)sensorData.filtMQ2);
+  Serial.print(F("       "));
+  if (!decision.gasCondition)                Serial.println(F("[!! GAZ ALARM]"));
+  else if (systemHealth.mq2.hasFault)        Serial.println(F("[!! ARIZALI]"));
+  else                                       Serial.println(F("[NORMAL]"));
+
+  Serial.println(F("------------------------------------------"));
+  Serial.println(F("  SULAMA KARARI                          "));
+  Serial.println(F("------------------------------------------"));
+  Serial.print(F("  Toprak Kuru   :  "));
+  Serial.println(decision.soilCondition  ? F("[KURU]    sulama gerekli") : F("[NEMLI]   sulama gerekmez"));
+  Serial.print(F("  Yagmur Yok    :  "));
+  Serial.println(decision.rainCondition  ? F("[YOK]     sulama uygun")   : F("[VAR]     sulama durdur"));
+  Serial.print(F("  Su Deposu     :  "));
+  Serial.println(decision.waterCondition ? F("[DOLU]    pompa calisir")  : F("[BOS]     pompa dur!"));
+  Serial.print(F("  Zaman         :  "));
+  Serial.println(decision.lightCondition ? F("[GECE]    sulama zamani")  : F("[GUNDUZ]  bekle"));
+  Serial.print(F("  Sicaklik      :  "));
+  Serial.println(decision.tempCondition  ? F("[UYGUN]   10C - 40C")      : F("[UYGUNSUZ] riskli sicaklik"));
+  Serial.print(F("  Sensor Saglik :  "));
+  Serial.println(decision.sensorHealthy  ? F("[SAGLIKLI]")               : F("[!! ARIZALI]"));
+  Serial.print(F("  Gaz Durumu    :  "));
+  Serial.println(decision.gasCondition   ? F("[GUVENLI]")                : F("[!! TEHLIKE]"));
+  Serial.print(F("  Pompa         :  "));
+  Serial.println(decision.pumpSafe       ? F("[HAZIR]")                  : F("[BEKLEME MODUNDA]"));
+
+  Serial.println(F("------------------------------------------"));
+  Serial.print(F("  >> SULAMA DURUMU : "));
+  if (decision.shouldIrrigate) {
+    Serial.println(F("*** AKTIF ***"));
+  } else {
+    Serial.println(F("    PASIF"));
+  }
+  Serial.print(F("  >> NEDEN         : "));
+  Serial.println(decision.reason);
+
+  Serial.println(F("------------------------------------------"));
+  Serial.print(F("  Hata Maskesi  :  0x"));
+  Serial.print(systemHealth.globalFaultMask, HEX);
+  Serial.print(F("   Kritik Hata : "));
+  Serial.println(systemHealth.criticalFault ? F("VAR !!") : F("YOK"));
+  Serial.println(F("==========================================\n"));
+}
+
+void sys_printBanner() {
+  Serial.println(F("\n╔══════════════════════════════════════════╗"));
+  Serial.println(F("║   IoT Akıllı Bahçe Sulama Sistemi        ║"));
+  Serial.println(F("║   Arduino Uno - Edge Computing Node      ║"));
+  Serial.print  (F("║   Firmware v")); Serial.print(FIRMWARE_VERSION);
+  Serial.println(F("                        ║"));
+  Serial.println(F("╚══════════════════════════════════════════╝"));
+}
+
+const char* sys_stateToStr(SystemState s) {
+  switch (s) {
+    case STATE_INIT:       return "INIT";
+    case STATE_MONITORING: return "MONITORING";
+    case STATE_IRRIGATING: return "IRRIGATING";
+    case STATE_COOLDOWN:   return "COOLDOWN";
+    case STATE_FAULT:      return "FAULT";
+    case STATE_EMERGENCY:  return "EMERGENCY";
+    default:               return "UNKNOWN";
+  }
+}
+
+const char* sys_sensorStatusToStr(SensorStatus s) {
+  switch (s) {
+    case SENSOR_OK:           return "OK";
+    case SENSOR_FAULT:        return "FAULT";
+    case SENSOR_FROZEN:       return "FROZEN";
+    case SENSOR_DISCONNECTED: return "DISCONNECTED";
+    case SENSOR_UNSTABLE:     return "UNSTABLE";
+    default:                  return "UNKNOWN";
+  }
+}
